@@ -24,3 +24,18 @@ def mysql_url():
         cur.execute(f"CREATE DATABASE {TEST_DB} CHARACTER SET utf8mb4")
     conn.close()
     yield f"mysql+pymysql://root:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{TEST_DB}"
+
+
+@pytest.fixture(scope="session")
+def migrated_url(mysql_url):
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", mysql_url)
+    command.upgrade(cfg, "head")
+    yield mysql_url
