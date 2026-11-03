@@ -18,7 +18,7 @@ def compute_state_hash(payload: dict) -> str:
     return _sha256_hex(_canonical(payload))
 
 
-def _format_observed_at(observed_at: datetime) -> str:
+def format_observed_at(observed_at: datetime) -> str:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware UTC")
     utc = observed_at.astimezone(timezone.utc)
@@ -26,7 +26,7 @@ def _format_observed_at(observed_at: datetime) -> str:
 
 
 def compute_event_id(feed: str, entity_id: str, observed_at: datetime, state_hash: str) -> str:
-    stamp = _format_observed_at(observed_at)
+    stamp = format_observed_at(observed_at)
     return _sha256_hex(_canonical([feed, entity_id, stamp, state_hash]))
 
 
