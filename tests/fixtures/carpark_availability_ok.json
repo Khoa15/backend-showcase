@@ -1,0 +1,8 @@
+{
+  "_source": "synthetic",
+  "value": [
+    {"CarParkID": "HE12", "Area": "Bishan", "Development": "Blk 1", "Location": "1.35 103.84", "AvailableLots": 12, "LotType": "C", "Agency": "HDB"},
+    {"CarParkID": "HE13", "Area": "Bishan", "Development": "Blk 2", "Location": "1.351 103.845", "AvailableLots": 0, "LotType": "C", "Agency": "HDB"},
+    {"CarParkID": "ACB7", "Area": "Ang Mo Kio", "Development": "Blk 7", "Location": "", "AvailableLots": 40, "LotType": "C", "Agency": "HDB"}
+  ]
+}
