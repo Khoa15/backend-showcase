@@ -65,7 +65,9 @@ def normalize_carparks(body: bytes, fetched_at: datetime, trace_id: str) -> Norm
             quarantined.extend(Quarantined("schema_invalid", record) for record, _ in items)
             continue
         payload, lat, lon = first
-        state_hash = compute_state_hash(payload)
+        # Coordinates are part of the state: a move with an unchanged lot count is a change.
+        state_hash = compute_state_hash({**payload, "lat": None if lat is None else str(lat),
+                                         "lon": None if lon is None else str(lon)})
         events.append(NormalizedEvent(
             event_id=compute_event_id(FEED, entity_id, observed_at, state_hash),
             feed=FEED, entity_id=entity_id, observed_at=observed_at, lat=lat, lon=lon,

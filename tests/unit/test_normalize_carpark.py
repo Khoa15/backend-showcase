@@ -53,3 +53,10 @@ def test_non_numeric_or_negative_lots_are_quarantined():
 def test_observed_at_is_truncated_to_milliseconds():
     e = normalize_carparks(body(rec()), T, TRACE).events[0]
     assert e.observed_at == datetime(2026, 11, 3, 12, 0, 0, 123000, tzinfo=timezone.utc)
+
+def test_coordinate_change_alone_produces_a_new_event_identity():
+    before = normalize_carparks(body(rec(Location="1.35 103.84")), T, TRACE).events[0]
+    after = normalize_carparks(body(rec(Location="1.36 103.84")), T, TRACE).events[0]
+    assert before.payload == after.payload
+    assert before.state_hash != after.state_hash
+    assert before.event_id != after.event_id
