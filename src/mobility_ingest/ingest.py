@@ -1,13 +1,15 @@
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Engine
 
-from mobility_ingest.contract import NormalizedEvent, Quarantined, format_observed_at
-from mobility_ingest.lease import assert_fenced
+from mobility_ingest.adapters import FeedAdapter, UpstreamError
+from mobility_ingest.contract import NormalizedEvent, NormalizeResult, Quarantined, format_observed_at
+from mobility_ingest.lease import acquire, assert_fenced
 
 
 def record_fetch(conn: Connection, feed: str, fetched_at: datetime, status: int,
@@ -119,3 +121,36 @@ def save_batch(conn: Connection, *, feed: str, fencing_token: int, raw_fetch_id:
              "raw_fetch_id": raw_fetch_id, "created_at": now})
     return SaveResult(inserted=inserted, skipped_unchanged=skipped_unchanged,
                       skipped_duplicate=skipped_duplicate, quarantined=len(quarantined))
+
+
+@dataclass(frozen=True)
+class PollResult:
+    status: str
+    inserted: int
+    skipped_unchanged: int
+    quarantined: int
+
+
+def poll_once(engine: Engine, *, adapter: FeedAdapter,
+              normalize: Callable[[bytes, datetime, str], NormalizeResult],
+              holder: str, lease_ttl_seconds: int, now: datetime, trace_id: str) -> PollResult:
+    with engine.begin() as conn:
+        token = acquire(conn, adapter.name, holder, lease_ttl_seconds, now)
+        if token is None:
+            return PollResult(status="skipped_lease", inserted=0, skipped_unchanged=0, quarantined=0)
+        try:
+            fetched = adapter.fetch()
+        except UpstreamError:
+            conn.execute(
+                text("INSERT INTO feed_state (feed, consecutive_failures) VALUES (:feed, 1) "
+                     "ON DUPLICATE KEY UPDATE consecutive_failures = consecutive_failures + 1"),
+                {"feed": adapter.name})
+            return PollResult(status="upstream_error", inserted=0, skipped_unchanged=0, quarantined=0)
+        changed, raw_fetch_id = record_fetch(conn, adapter.name, now, fetched.status, fetched.body)
+        if not changed:
+            return PollResult(status="skipped_unchanged", inserted=0, skipped_unchanged=0, quarantined=0)
+        result = normalize(fetched.body, now, trace_id)
+        saved = save_batch(conn, feed=adapter.name, fencing_token=token, raw_fetch_id=raw_fetch_id,
+                           events=result.events, quarantined=result.quarantined)
+        return PollResult(status="ok", inserted=saved.inserted,
+                          skipped_unchanged=saved.skipped_unchanged, quarantined=saved.quarantined)
