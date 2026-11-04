@@ -131,6 +131,14 @@ class PollResult:
     quarantined: int
 
 
+def _upstream_failure(conn: Connection, feed: str) -> "PollResult":
+    conn.execute(
+        text("INSERT INTO feed_state (feed, consecutive_failures) VALUES (:feed, 1) "
+             "ON DUPLICATE KEY UPDATE consecutive_failures = consecutive_failures + 1"),
+        {"feed": feed})
+    return PollResult(status="upstream_error", inserted=0, skipped_unchanged=0, quarantined=0)
+
+
 def poll_once(engine: Engine, *, adapter: FeedAdapter,
               normalize: Callable[[bytes, datetime, str], NormalizeResult],
               holder: str, lease_ttl_seconds: int, now: datetime, trace_id: str) -> PollResult:
@@ -141,11 +149,10 @@ def poll_once(engine: Engine, *, adapter: FeedAdapter,
         try:
             fetched = adapter.fetch()
         except UpstreamError:
-            conn.execute(
-                text("INSERT INTO feed_state (feed, consecutive_failures) VALUES (:feed, 1) "
-                     "ON DUPLICATE KEY UPDATE consecutive_failures = consecutive_failures + 1"),
-                {"feed": adapter.name})
-            return PollResult(status="upstream_error", inserted=0, skipped_unchanged=0, quarantined=0)
+            return _upstream_failure(conn, adapter.name)
+        if not 200 <= fetched.status < 300:
+            # An error page is not feed data: do not store it as a fetch or normalize it.
+            return _upstream_failure(conn, adapter.name)
         changed, raw_fetch_id = record_fetch(conn, adapter.name, now, fetched.status, fetched.body)
         if not changed:
             return PollResult(status="skipped_unchanged", inserted=0, skipped_unchanged=0, quarantined=0)

@@ -45,3 +45,35 @@ def test_upstream_error_records_failure_and_creates_no_events(migrated_url):
     with eng.connect() as c:
         assert c.execute(text("SELECT consecutive_failures FROM feed_state WHERE feed=:f"),
                          {"f": "carpark_availability_broken"}).scalar() == 1
+
+class StaticAdapter:
+    def __init__(self, name, status, body):
+        self.name, self._status, self._body = name, status, body
+    def set_body(self, body):
+        self._body = body
+    def fetch(self):
+        from mobility_ingest.adapters import FetchResult
+        return FetchResult(status=self._status, body=self._body)
+
+def _lots(c_lots, y_lots):
+    import json
+    base = {"Area": "A", "Development": "D", "Location": "1.35 103.84", "Agency": "HDB", "CarParkID": "MULTI1"}
+    return json.dumps({"value": [{**base, "LotType": "C", "AvailableLots": c_lots},
+                                 {**base, "LotType": "Y", "AvailableLots": y_lots}]}).encode()
+
+def test_changing_one_lot_type_inserts_only_that_lot_type(migrated_url):
+    adapter = StaticAdapter("carpark_multilot", 200, _lots(5, 9))
+    assert run(migrated_url, adapter, T0).inserted == 2
+    adapter.set_body(_lots(6, 9))
+    r = run(migrated_url, adapter, T0 + timedelta(minutes=1), holder="node-1")
+    assert (r.inserted, r.skipped_unchanged) == (1, 1)
+
+def test_non_2xx_response_is_an_upstream_error_and_is_not_stored(migrated_url):
+    adapter = StaticAdapter("carpark_http503", 503, b"<html>503 Service Unavailable</html>")
+    r = run(migrated_url, adapter, T0)
+    assert r.status == "upstream_error"
+    with make_engine(migrated_url).connect() as c:
+        feed = {"f": "carpark_http503"}
+        assert c.execute(text("SELECT COUNT(*) FROM raw_fetch WHERE feed=:f"), feed).scalar() == 0
+        assert c.execute(text("SELECT COUNT(*) FROM quarantine WHERE feed=:f"), feed).scalar() == 0
+        assert c.execute(text("SELECT consecutive_failures FROM feed_state WHERE feed=:f"), feed).scalar() == 1
