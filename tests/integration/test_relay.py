@@ -1,9 +1,10 @@
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 import pytest
 from sqlalchemy import text
 from mobility_ingest.db import make_engine
-from mobility_ingest.outbox import relay_once, purge_outbox, OutboxRow
+from mobility_ingest.outbox import relay_once, purge_outbox, OutboxRow, PartialPublish
 
 pytestmark = pytest.mark.integration
 
@@ -62,3 +63,44 @@ def test_purge_removes_only_fully_sent_old_rows(migrated_url):
         c.execute(text("UPDATE outbox SET created_at = now(3) - INTERVAL 4 DAY WHERE event_id = :eid"),
                   {"eid": seeded_id("d")})
     assert purge_outbox(eng, older_than_days=3) >= 1
+
+class BlockingSink(RecordingSink):
+    def __init__(self, name):
+        super().__init__(name)
+        self.entered, self.release = threading.Event(), threading.Event()
+    def publish(self, rows):
+        self.entered.set()
+        assert self.release.wait(30)
+        return super().publish(rows)
+
+def test_relay_of_one_sink_does_not_block_another_sink(migrated_url):
+    eng = make_engine(migrated_url); seed(eng, 3, "e")
+    slow = BlockingSink("kafka")
+    worker = threading.Thread(target=relay_once, args=(eng, slow, 1000))
+    worker.start()
+    try:
+        assert slow.entered.wait(30)
+        fast = RecordingSink("opensearch")
+        started = time.monotonic()
+        relay_once(eng, fast, 1000)
+        assert time.monotonic() - started < 5, "opensearch relay waited on the kafka relay's locks"
+        assert len(fast.seen) >= 3
+    finally:
+        slow.release.set(); worker.join()
+
+class PartialSink(RecordingSink):
+    def publish(self, rows):
+        acked = [rows[0].outbox_id]
+        raise PartialPublish(acked, RuntimeError(f"outbox {rows[1].outbox_id}: broker rejected"))
+
+def test_partial_publish_marks_acked_sent_and_counts_attempt_only_for_the_rest(migrated_url):
+    eng = make_engine(migrated_url); seed(eng, 2, "f")
+    assert relay_once(eng, PartialSink("kafka"), 1000) == 1
+    with eng.connect() as c:
+        rows = {r.event_id: r for r in c.execute(text(
+            "SELECT o.event_id, od.sent_at, od.attempts, od.last_error FROM outbox_delivery od "
+            "JOIN outbox o ON o.id=od.outbox_id WHERE o.event_id IN (:a,:b) AND od.sink='kafka'"),
+            {"a": seeded_id("f", 0), "b": seeded_id("f", 1)})}
+    sent, failed = rows[seeded_id("f", 0)], rows[seeded_id("f", 1)]
+    assert sent.sent_at is not None and sent.attempts == 0 and sent.last_error is None
+    assert failed.sent_at is None and failed.attempts == 1 and "broker rejected" in failed.last_error

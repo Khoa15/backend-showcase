@@ -16,6 +16,18 @@ class OutboxRow:
     headers: dict[str, str]
 
 
+class PartialPublish(Exception):
+    """A sink delivered some rows of a batch and failed the rest.
+
+    `acked` rows are marked sent; every other row of the batch is recorded as a failed attempt.
+    """
+
+    def __init__(self, acked: list[int], error: Exception | str):
+        super().__init__(str(error))
+        self.acked = acked
+        self.error = error if isinstance(error, Exception) else RuntimeError(error)
+
+
 class Sink(Protocol):
     name: str
 
@@ -30,8 +42,9 @@ def _record_failure(engine: Engine, sink_name: str, outbox_ids: list[int], error
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE outbox_delivery SET attempts = attempts + 1, last_error = LEFT(:err, 255) "
-                 "WHERE sink = :sink AND outbox_id IN :ids").bindparams(bindparam("ids", expanding=True)),
-            {"err": f"{type(error).__name__}: {error}", "sink": sink_name, "ids": outbox_ids})
+                 "WHERE outbox_id = :id AND sink = :sink"),
+            [{"err": f"{type(error).__name__}: {error}", "sink": sink_name, "id": oid}
+             for oid in outbox_ids])
 
 
 def relay_once(engine: Engine, sink: Sink, batch_size: int = 100) -> int:
@@ -42,7 +55,7 @@ def relay_once(engine: Engine, sink: Sink, batch_size: int = 100) -> int:
                 text("SELECT o.id, o.topic, o.partition_key, o.payload FROM outbox_delivery od "
                      "JOIN outbox o ON o.id = od.outbox_id "
                      "WHERE od.sink = :sink AND od.sent_at IS NULL "
-                     "ORDER BY od.outbox_id LIMIT :n FOR UPDATE SKIP LOCKED"),
+                     "ORDER BY od.outbox_id LIMIT :n FOR UPDATE OF od SKIP LOCKED"),
                 {"sink": sink.name, "n": batch_size}).all()
             if not rows:
                 return 0
@@ -53,13 +66,23 @@ def relay_once(engine: Engine, sink: Sink, batch_size: int = 100) -> int:
                                        payload=payload,
                                        headers={"schema_version": str(payload["schema_version"])}))
             attempted = [r.outbox_id for r in batch]
-            acked = sink.publish(batch)
+            partial: PartialPublish | None = None
+            try:
+                acked = sink.publish(batch)
+            except PartialPublish as exc:
+                acked, partial = exc.acked, exc
             if acked:
+                # Point updates on the primary key (outbox_id, sink): an `outbox_id IN (...)` range
+                # would also lock the other sinks' rows for the same outbox ids and serialize relays.
                 conn.execute(
                     text("UPDATE outbox_delivery SET sent_at = now(3) "
-                         "WHERE sink = :sink AND outbox_id IN :ids").bindparams(bindparam("ids", expanding=True)),
-                    {"sink": sink.name, "ids": acked})
-            return len(acked)
+                         "WHERE outbox_id = :id AND sink = :sink"),
+                    [{"id": oid, "sink": sink.name} for oid in acked])
+        if partial is not None:
+            # Committed above: the delivered rows stay sent; only the undelivered ones count an attempt.
+            acked_ids = set(acked)
+            _record_failure(engine, sink.name, [i for i in attempted if i not in acked_ids], partial.error)
+        return len(acked)
     except Exception as exc:
         # Recorded after the transaction above has rolled back and released its locks.
         if attempted:
