@@ -349,7 +349,7 @@ Delivery rows are created in the same transaction as the outbox row, one per con
 ### Relay rules
 - Per sink, select pending rows `ORDER BY outbox_id LIMIT N FOR UPDATE SKIP LOCKED`, so several
   instances can run for HA without double work.
-- Kafka sink: publish with `acks=all`, `partition_key` (e.g. carpark id) to keep per-entity order.
+- Kafka sink: publish with `acks=all`, `partition_key` (e.g. carpark id and lot type) to keep per-entity order.
 - OpenSearch sink: bulk index with `_id = event_id` into `events-YYYY.MM.DD`. A replay overwrites the same
   document and does not duplicate it.
 - Mark `sent_at` only after the sink acknowledges. A crash between publish and mark causes a
@@ -642,7 +642,7 @@ CREATE TABLE raw_fetch (                  -- original response, for re-parse
 CREATE TABLE normalized_events (          -- partitioned by month on observed_at
   event_id CHAR(64) NOT NULL,
   feed VARCHAR(64) NOT NULL,
-  entity_id VARCHAR(128) NOT NULL,        -- carpark id, or incident_key for incidents
+  entity_id VARCHAR(128) NOT NULL,        -- '<carpark id>:<lot type>' for carparks, or incident_key for incidents
   observed_at DATETIME(3) NOT NULL,
   lat DECIMAL(9,6) NULL,
   lon DECIMAL(9,6) NULL,

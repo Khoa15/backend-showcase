@@ -85,7 +85,7 @@ Fixture data: the field names below follow LTA DataMall `CarParkAvailability` as
 class NormalizedEvent:
     event_id: str          # 64 lowercase hex chars
     feed: str              # "carpark_availability"
-    entity_id: str         # CarParkID, e.g. "HE12"
+    entity_id: str         # "{CarParkID}:{LotType}", e.g. "HE12:C"
     observed_at: datetime  # fetch time, UTC, millisecond precision
     lat: Decimal | None
     lon: Decimal | None
@@ -301,7 +301,7 @@ git commit -m "feat: add versioned carpark availability event schema"
 **Mapping (exact):**
 - Input: JSON object with key `value`, a list of records (LTA `CarParkAvailability` shape).
 - Per record: validate against `carpark_availability.v1`; on `SchemaInvalid` add `Quarantined("schema_invalid", record)`.
-- `entity_id` = `CarParkID`.
+- `entity_id` = `"{CarParkID}:{LotType}"` (one entity per lot type, so change detection and Kafka ordering are per lot type; `CarParkID` and `LotType` stay in `payload`).
 - `lat`, `lon` = `Location` split on a single space, parsed as `Decimal`. If `Location` is missing, empty or not two numbers, both are `None`.
 - `payload` = `{"CarParkID", "Area", "Development", "LotType", "Agency", "AvailableLots"}` with absent optional keys set to `None`. Unknown upstream keys are dropped here, before hashing.
 - `observed_at` = `fetched_at` truncated to milliseconds.
