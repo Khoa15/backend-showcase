@@ -60,3 +60,8 @@ def test_coordinate_change_alone_produces_a_new_event_identity():
     assert before.payload == after.payload
     assert before.state_hash != after.state_hash
     assert before.event_id != after.event_id
+
+def test_each_lot_type_of_a_car_park_is_its_own_entity():
+    res = normalize_carparks(body(rec(LotType="C", AvailableLots=5), rec(LotType="Y", AvailableLots=9)), T, TRACE)
+    assert sorted(e.entity_id for e in res.events) == ["HE12:C", "HE12:Y"]
+    assert {e.payload["CarParkID"] for e in res.events} == {"HE12"}

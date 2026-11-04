@@ -59,7 +59,9 @@ def normalize_carparks(body: bytes, fetched_at: datetime, trace_id: str) -> Norm
             (record, (payload, lat, lon)))
 
     events: list[NormalizedEvent] = []
-    for (entity_id, _lot), items in groups.items():
+    for (car_park_id, lot_type), items in groups.items():
+        # One entity per lot type: change detection and Kafka ordering are per (car park, lot type).
+        entity_id = f"{car_park_id}:{lot_type}"
         first = items[0][1]
         if any(candidate != first for _, candidate in items[1:]):
             quarantined.extend(Quarantined("schema_invalid", record) for record, _ in items)
