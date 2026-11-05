@@ -1,0 +1,857 @@
+openapi: 3.1.0
+info:
+  title: Motorist Dashboard API (api-gateway)
+  version: 0.1.0
+  summary: Public API the React dashboard uses. Served by api-gateway, backed by control-api.
+  description: |
+    **Status: draft for review.** The api-gateway service is not in the pipeline spec yet
+    (`2026-11-04-motorist-mobility-pipeline-design.md`, section 7); this document assumes a thin
+    edge gateway in front of `control-api`. Names of fields, steps, categories and states follow the
+    spec's tables (`feed_state`, `service_status`, `step_health`, `pipeline_errors`, `dlq_index`,
+    `control_audit`, `quarantine`, `outbox_delivery`).
+
+    **Rules**
+    - The UI talks only to the gateway. The gateway authenticates, authorizes by role, rate limits,
+      and forwards to `control-api`. It holds no business logic.
+    - Reads come from `control-api`'s read model (fed by `control.status` and `pipeline.errors`).
+      Event and notification search is read from OpenSearch through `control-api`.
+    - Control actions never call a domain service. They publish to `control.commands` and write
+      `control_audit`. They return **202** with an audit id; the effect shows up when the target
+      service reports back on `control.status` (audit `result` moves `issued` to `applied` or `failed`).
+    - All timestamps are UTC ISO 8601 with milliseconds. All errors use RFC 9457 problem details.
+    - Roles: `viewer` (all GET), `operator` (feeds, errors, DLQ, circuits actions), `admin` (rules).
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8080
+    description: Local docker-compose
+security:
+  - bearerAuth: []
+tags:
+  - name: Overview
+  - name: Pipeline
+  - name: Errors
+  - name: Feeds
+  - name: Outbox
+  - name: DLQ
+  - name: Quarantine
+  - name: Search
+  - name: Rules
+  - name: Circuits
+  - name: Audit
+  - name: Stream
+  - name: Gateway
+
+paths:
+  /health:
+    get:
+      tags: [Gateway]
+      operationId: getGatewayHealth
+      summary: Gateway liveness and upstream reachability
+      security: []
+      responses:
+        "200":
+          description: Gateway is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, upstream]
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  upstream:
+                    type: object
+                    properties:
+                      control_api: { type: string, enum: [up, down] }
+
+  /api/v1/overview:
+    get:
+      tags: [Overview]
+      operationId: getOverview
+      summary: One-screen summary for the landing page
+      description: Counts and the worst current problems. Every figure carries the window it covers.
+      parameters: [{ $ref: "#/components/parameters/WindowMinutes" }]
+      responses:
+        "200":
+          description: Overview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overview" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/services:
+    get:
+      tags: [Overview]
+      operationId: listServices
+      summary: Service instances and their last heartbeat (service_status)
+      responses:
+        "200":
+          description: Instances.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ServiceInstance" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/pipeline/steps:
+    get:
+      tags: [Pipeline]
+      operationId: getPipelineSteps
+      summary: Pipeline map, one entry per service and step (step_health)
+      parameters: [{ $ref: "#/components/parameters/WindowMinutes" }]
+      responses:
+        "200":
+          description: Step health for the window.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StepHealth" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/errors:
+    get:
+      tags: [Errors]
+      operationId: listErrors
+      summary: Pipeline errors (pipeline_errors), newest first
+      parameters:
+        - { name: service, in: query, schema: { type: string } }
+        - { name: step, in: query, schema: { $ref: "#/components/schemas/Step" } }
+        - { name: category, in: query, schema: { $ref: "#/components/schemas/ErrorCategory" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/ErrorStatus" } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: A page of errors.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/PipelineError" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/errors/{service}/{fingerprint}:
+    parameters:
+      - { $ref: "#/components/parameters/ErrorService" }
+      - { $ref: "#/components/parameters/Fingerprint" }
+    get:
+      tags: [Errors]
+      operationId: getError
+      summary: Error detail with plain-language explanation and suggested action
+      responses:
+        "200":
+          description: Error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PipelineErrorDetail" }
+        "404": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/errors/{service}/{fingerprint}/retry:
+    parameters:
+      - { $ref: "#/components/parameters/ErrorService" }
+      - { $ref: "#/components/parameters/Fingerprint" }
+    post:
+      tags: [Errors]
+      operationId: retryError
+      summary: Retry one error once through the normal path
+      x-required-role: operator
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        "409": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/errors/{service}/{fingerprint}/ignore:
+    parameters:
+      - { $ref: "#/components/parameters/ErrorService" }
+      - { $ref: "#/components/parameters/Fingerprint" }
+    post:
+      tags: [Errors]
+      operationId: ignoreError
+      summary: Mark an error as ignored
+      x-required-role: operator
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/errors/retry:
+    post:
+      tags: [Errors]
+      operationId: retryErrorsByCategory
+      summary: Retry every open error of a category
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category]
+              properties:
+                category: { $ref: "#/components/schemas/ErrorCategory" }
+                service: { type: string }
+                step: { $ref: "#/components/schemas/Step" }
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/feeds:
+    get:
+      tags: [Feeds]
+      operationId: listFeeds
+      summary: Per-feed status (feed_state plus current lease holder)
+      responses:
+        "200":
+          description: Feeds.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Feed" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/feeds/{feed}:
+    parameters: [{ $ref: "#/components/parameters/FeedName" }]
+    get:
+      tags: [Feeds]
+      operationId: getFeed
+      summary: One feed
+      responses:
+        "200":
+          description: Feed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Feed" }
+        "404": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/feeds/{feed}/pause:
+    parameters: [{ $ref: "#/components/parameters/FeedName" }]
+    post:
+      tags: [Feeds]
+      operationId: pauseFeed
+      summary: Pause polling for a feed
+      x-required-role: operator
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/feeds/{feed}/resume:
+    parameters: [{ $ref: "#/components/parameters/FeedName" }]
+    post:
+      tags: [Feeds]
+      operationId: resumeFeed
+      summary: Resume polling for a feed
+      x-required-role: operator
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/feeds/{feed}/replay:
+    parameters: [{ $ref: "#/components/parameters/FeedName" }]
+    post:
+      tags: [Feeds]
+      operationId: replayFeed
+      summary: Re-normalize stored raw fetches in a time range
+      description: Reads `raw_fetch` for the range. Event ids are deterministic, so replays do not duplicate.
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from: { type: string, format: date-time }
+                to: { type: string, format: date-time }
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/outbox:
+    get:
+      tags: [Outbox]
+      operationId: getOutboxBacklog
+      summary: Outbox backlog per service and sink (outbox_delivery)
+      responses:
+        "200":
+          description: Backlog.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/OutboxBacklog" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/quarantine:
+    get:
+      tags: [Quarantine]
+      operationId: listQuarantine
+      summary: Quarantined records
+      parameters:
+        - { name: feed, in: query, schema: { type: string } }
+        - { name: reason, in: query, schema: { type: string, enum: [schema_invalid, low_confidence, parse_error] } }
+        - { name: resolved, in: query, schema: { type: boolean } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: A page of quarantined records.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/QuarantineRecord" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/dlq:
+    get:
+      tags: [DLQ]
+      operationId: listDlq
+      summary: Dead-letter messages (dlq_index; the message itself stays in Kafka)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [open, replayed, discarded] } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: A page of DLQ entries.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/DlqEntry" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/dlq/replay:
+    post:
+      tags: [DLQ]
+      operationId: replayDlq
+      summary: Replay selected DLQ messages
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: integer, format: int64 }
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/events/search:
+    get:
+      tags: [Search]
+      operationId: searchEvents
+      summary: Search normalized events (OpenSearch events-*)
+      parameters:
+        - { name: q, in: query, schema: { type: string, maxLength: 200 } }
+        - { name: feed, in: query, schema: { type: string } }
+        - { name: entity_id, in: query, description: "Carpark entities look like HE12:C.", schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200":
+          description: Matching events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, items]
+                properties:
+                  total: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Event" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/journey:
+    get:
+      tags: [Search]
+      operationId: getJourney
+      summary: Every step one item passed through, and where it stopped
+      description: Exactly one of the four identifiers must be given.
+      parameters:
+        - { name: event_id, in: query, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+        - { name: trace_id, in: query, schema: { type: string, pattern: "^[0-9a-f]{32}$" } }
+        - { name: notification_id, in: query, schema: { type: string } }
+        - { name: incident_key, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Journey.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [steps]
+                properties:
+                  steps:
+                    type: array
+                    items:
+                      type: object
+                      required: [step, state, at]
+                      properties:
+                        step: { $ref: "#/components/schemas/Step" }
+                        state: { type: string, enum: [ok, retrying, failed, not_reached] }
+                        at: { type: [string, "null"], format: date-time }
+                        detail: { type: [string, "null"] }
+        "400": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/rules:
+    get:
+      tags: [Rules]
+      operationId: listRules
+      summary: Alert rules
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Rule" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/rules/{rule_id}/state:
+    put:
+      tags: [Rules]
+      operationId: setRuleState
+      summary: Enable or disable a rule
+      x-required-role: admin
+      parameters:
+        - { name: rule_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        "404": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/circuits:
+    get:
+      tags: [Circuits]
+      operationId: listCircuits
+      summary: Webhook endpoint circuit breakers
+      responses:
+        "200":
+          description: Circuits.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Circuit" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/circuits/{endpoint_id}:
+    put:
+      tags: [Circuits]
+      operationId: setCircuitState
+      summary: Force an endpoint circuit open or closed (endpoint.circuit command)
+      x-required-role: operator
+      parameters:
+        - { name: endpoint_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state: { type: string, enum: [open, closed] }
+      responses:
+        "202": { $ref: "#/components/responses/CommandAccepted" }
+        "404": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      operationId: listAudit
+      summary: Control actions (control_audit), newest first
+      parameters:
+        - { name: actor, in: query, schema: { type: string } }
+        - { name: command_type, in: query, schema: { type: string } }
+        - { name: result, in: query, schema: { type: string, enum: [issued, applied, failed] } }
+        - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AuditEntry" }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /api/v1/stream:
+    get:
+      tags: [Stream]
+      operationId: streamUpdates
+      summary: Server-sent events with live changes
+      description: |
+        `text/event-stream`. Event names: `service` (a `ServiceInstance`), `step` (a `StepHealth`),
+        `error` (a `PipelineError`), `audit` (an `AuditEntry`). The client reconnects with
+        `Last-Event-ID`; the gateway may close an idle stream after 5 minutes.
+        Browsers cannot set an Authorization header on `EventSource`, so the UI uses a fetch-based
+        reader with the bearer token.
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        default: { $ref: "#/components/responses/Problem" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Issued by the identity provider. The gateway reads the `role` claim.
+
+  parameters:
+    WindowMinutes:
+      name: window_minutes
+      in: query
+      description: Look-back window. Default 60.
+      schema: { type: integer, minimum: 5, maximum: 1440, default: 60 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    FeedName:
+      name: feed
+      in: path
+      required: true
+      schema: { type: string, example: carpark_availability }
+    ErrorService:
+      name: service
+      in: path
+      required: true
+      schema: { type: string, example: mobility-ingest }
+    Fingerprint:
+      name: fingerprint
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+
+  responses:
+    CommandAccepted:
+      description: Command published to `control.commands` and written to `control_audit`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/CommandAccepted" }
+    Problem:
+      description: Error (RFC 9457). 400 invalid input, 401 no or bad token, 403 role too low, 404 unknown, 409 not allowed in the current state, 429 rate limited, 502/503/504 upstream trouble.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        request_id: { type: string }
+
+    Page:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: {} }
+        next_cursor: { type: [string, "null"], description: Null on the last page. }
+
+    CommandAccepted:
+      type: object
+      required: [audit_id, command_type, result]
+      properties:
+        audit_id: { type: integer, format: int64 }
+        command_type: { type: string, example: feed.pause }
+        result: { type: string, enum: [issued] }
+
+    Step:
+      type: string
+      enum: [poll, fetch, parse, save, relay.kafka, relay.opensearch, consume, match, notify, webhook]
+
+    ErrorCategory:
+      type: string
+      enum:
+        - network_transient
+        - rate_limited
+        - upstream_5xx
+        - dependency_down
+        - db_transient
+        - endpoint_circuit_open
+        - unsupported_schema
+        - schema_invalid
+        - parse_low_confidence
+        - permanent_4xx
+        - data_conflict
+        - unexpected
+
+    ErrorStatus:
+      type: string
+      enum: [retrying, resolved, exhausted, ignored]
+
+    ServiceState:
+      type: string
+      enum: [running, paused, degraded, down]
+
+    Health:
+      type: string
+      enum: [healthy, retrying, failing]
+
+    Overview:
+      type: object
+      required: [window_minutes, services, feeds, errors, outbox]
+      properties:
+        window_minutes: { type: integer }
+        services:
+          type: object
+          properties:
+            running: { type: integer }
+            paused: { type: integer }
+            degraded: { type: integer }
+            down: { type: integer }
+        feeds:
+          type: object
+          properties:
+            total: { type: integer }
+            paused: { type: integer }
+            failing: { type: integer, description: Feeds with consecutive_failures above the alert threshold. }
+        errors:
+          type: object
+          properties:
+            open: { type: integer, description: Errors in retrying or exhausted. }
+            exhausted: { type: integer }
+        outbox:
+          type: object
+          properties:
+            pending_total: { type: integer, format: int64 }
+            oldest_pending_age_seconds: { type: [integer, "null"] }
+        worst_step:
+          oneOf:
+            - $ref: "#/components/schemas/StepHealth"
+            - type: "null"
+
+    ServiceInstance:
+      type: object
+      required: [instance_id, service, version, state, last_heartbeat_at]
+      properties:
+        instance_id: { type: string }
+        service: { type: string }
+        version: { type: string }
+        state: { $ref: "#/components/schemas/ServiceState" }
+        last_heartbeat_at: { type: string, format: date-time }
+        consumer_lag: { type: [integer, "null"], format: int64 }
+        error_rate: { type: [number, "null"], minimum: 0, maximum: 1 }
+        outbox_backlog:
+          type: [object, "null"]
+          description: Pending rows by sink.
+          additionalProperties: { type: integer, format: int64 }
+          example: { kafka: 0, opensearch: 12 }
+
+    StepHealth:
+      type: object
+      required: [service, step, health, ok_count, retry_count, failed_count]
+      properties:
+        service: { type: string }
+        step: { $ref: "#/components/schemas/Step" }
+        health: { $ref: "#/components/schemas/Health" }
+        ok_count: { type: integer }
+        retry_count: { type: integer }
+        failed_count: { type: integer }
+        p95_ms: { type: [integer, "null"] }
+        backlog: { type: [integer, "null"], format: int64, description: Lag or backlog where the step has one. }
+
+    PipelineError:
+      type: object
+      required: [service, fingerprint, step, category, error_code, retryable, message, status, attempts, occurrences, first_seen_at, last_seen_at]
+      properties:
+        service: { type: string }
+        fingerprint: { type: string }
+        trace_id: { type: [string, "null"] }
+        step: { $ref: "#/components/schemas/Step" }
+        category: { $ref: "#/components/schemas/ErrorCategory" }
+        error_code: { type: string }
+        retryable: { type: boolean }
+        message: { type: string, maxLength: 1000 }
+        status: { $ref: "#/components/schemas/ErrorStatus" }
+        attempts: { type: integer }
+        occurrences: { type: integer }
+        first_seen_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        next_retry_at: { type: [string, "null"], format: date-time }
+        resolved_at: { type: [string, "null"], format: date-time }
+
+    PipelineErrorDetail:
+      allOf:
+        - $ref: "#/components/schemas/PipelineError"
+        - type: object
+          properties:
+            detail: { type: [string, "null"], description: Truncated stack trace. }
+            context:
+              type: [object, "null"]
+              description: feed, event_id, rule_id, notification_id, topic, partition, offset.
+              additionalProperties: true
+            explanation: { type: string, description: Plain-language meaning of the category. }
+            suggested_action: { type: string }
+            allowed_actions:
+              type: array
+              items: { type: string, enum: [retry, ignore, pause_feed, replay_dlq] }
+            raw_payload_ref:
+              type: [object, "null"]
+              properties:
+                kind: { type: string, enum: [raw_fetch, quarantine] }
+                id: { type: integer, format: int64 }
+
+    Feed:
+      type: object
+      required: [feed, paused, consecutive_failures]
+      properties:
+        feed: { type: string }
+        paused: { type: boolean }
+        last_polled_at: { type: [string, "null"], format: date-time }
+        last_success_at: { type: [string, "null"], format: date-time }
+        consecutive_failures: { type: integer }
+        lease_holder: { type: [string, "null"] }
+        fencing_token: { type: [integer, "null"], format: int64 }
+
+    OutboxBacklog:
+      type: object
+      required: [service, sink, pending, attempts]
+      properties:
+        service: { type: string }
+        sink: { type: string, enum: [kafka, opensearch] }
+        pending: { type: integer, format: int64 }
+        attempts: { type: integer, format: int64, description: Failed delivery attempts on pending rows. }
+        oldest_pending_age_seconds: { type: [integer, "null"] }
+        last_error: { type: [string, "null"] }
+
+    QuarantineRecord:
+      type: object
+      required: [id, feed, reason, content, created_at, resolved]
+      properties:
+        id: { type: integer, format: int64 }
+        feed: { type: string }
+        reason: { type: string, enum: [schema_invalid, low_confidence, parse_error] }
+        content: { description: The rejected record or body (JSON or text). }
+        raw_fetch_id: { type: [integer, "null"], format: int64 }
+        created_at: { type: string, format: date-time }
+        resolved: { type: boolean }
+
+    DlqEntry:
+      type: object
+      required: [id, topic, partition, offset, first_failed_at, status]
+      properties:
+        id: { type: integer, format: int64 }
+        topic: { type: string }
+        partition: { type: integer }
+        offset: { type: integer, format: int64 }
+        message_key: { type: [string, "null"] }
+        error: { type: [string, "null"] }
+        first_failed_at: { type: string, format: date-time }
+        status: { type: string, enum: [open, replayed, discarded] }
+
+    Event:
+      type: object
+      required: [event_id, schema_version, type, feed, entity_id, observed_at, payload]
+      properties:
+        event_id: { type: string, pattern: "^[0-9a-f]{64}$" }
+        schema_version: { type: integer }
+        type: { type: string, example: carpark_availability }
+        feed: { type: string }
+        entity_id: { type: string, example: "HE12:C" }
+        observed_at: { type: string, format: date-time }
+        trace_id: { type: [string, "null"] }
+        lat: { type: [string, "null"], description: Decimal as text. }
+        lon: { type: [string, "null"], description: Decimal as text. }
+        state_hash: { type: string }
+        payload: { type: object, additionalProperties: true }
+
+    Rule:
+      type: object
+      required: [rule_id, name, enabled]
+      properties:
+        rule_id: { type: string }
+        name: { type: string }
+        enabled: { type: boolean }
+        kind: { type: string, enum: [threshold, incident] }
+        updated_at: { type: string, format: date-time }
+
+    Circuit:
+      type: object
+      required: [endpoint_id, state]
+      properties:
+        endpoint_id: { type: string }
+        url_host: { type: string, description: Host only. Secrets and paths are never returned. }
+        state: { type: string, enum: [closed, open, half_open] }
+        opened_at: { type: [string, "null"], format: date-time }
+        deferred_count: { type: integer }
+        forced: { type: boolean, description: True when an operator forced the state. }
+
+    AuditEntry:
+      type: object
+      required: [id, actor, command_type, target, result, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        actor: { type: string }
+        command_type: { type: string, example: feed.pause }
+        target: { type: string }
+        params: { type: [object, "null"], additionalProperties: true }
+        result: { type: string, enum: [issued, applied, failed] }
+        created_at: { type: string, format: date-time }

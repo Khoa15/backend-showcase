@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "carpark_availability.v1",
+  "type": "object",
+  "required": ["CarParkID", "AvailableLots", "LotType", "Agency"],
+  "properties": {
+    "CarParkID": {"type": "string", "minLength": 1},
+    "Area": {"type": "string"},
+    "Development": {"type": "string"},
+    "Location": {"type": "string"},
+    "AvailableLots": {"type": "integer", "minimum": 0},
+    "LotType": {"type": "string", "minLength": 1},
+    "Agency": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}

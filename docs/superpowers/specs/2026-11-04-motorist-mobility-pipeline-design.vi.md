@@ -627,7 +627,7 @@ CREATE TABLE raw_fetch (                  -- original response, for re-parse
 CREATE TABLE normalized_events (          -- partitioned by month on observed_at
   event_id CHAR(64) NOT NULL,
   feed VARCHAR(64) NOT NULL,
-  entity_id VARCHAR(128) NOT NULL,        -- carpark id, or incident_key for incidents
+  entity_id VARCHAR(128) NOT NULL,        -- '<carpark id>:<lot type>' for carparks, or incident_key for incidents
   observed_at DATETIME(3) NOT NULL,
   lat DECIMAL(9,6) NULL,
   lon DECIMAL(9,6) NULL,
